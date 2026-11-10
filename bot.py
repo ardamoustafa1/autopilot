@@ -1,107 +1,104 @@
-import os, time, json, sqlite3, logging
+import json
+import logging
+import os
+import sys
+import time
 from datetime import datetime
-from zoneinfo import ZoneInfo
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
 import requests
 from requests_oauthlib import OAuth1
 from dotenv import load_dotenv
 
-ROOT=Path(__file__).resolve().parent
-load_dotenv(ROOT/'.env')
-TZ=ZoneInfo('Europe/Istanbul')
-DRY_RUN=os.getenv('DRY_RUN','true').lower()!='false'
-DB=ROOT/'state.sqlite3'
-TEXT={
-'combo': '''I thought I made an easy puzzle game.
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / '.env')
+STATE = ROOT / 'state.json'
+TZ = ZoneInfo('Europe/Istanbul')
+DRY_RUN = os.getenv('DRY_RUN', 'true').lower() != 'false'
+# An exact post (text + video) is never automatically repeated.
+# Additional original posts can be added to posts.json.
 
-Then I watched people struggle with it. 💀
+def credentials():
+    keys = ['X_API_KEY', 'X_API_SECRET', 'X_ACCESS_TOKEN', 'X_ACCESS_TOKEN_SECRET']
+    values = [os.getenv(key) for key in keys]
+    if not all(values):
+        raise RuntimeError('Missing environment variables: ' + ', '.join(k for k, v in zip(keys, values) if not v))
+    return OAuth1(*values)
 
-One move can trigger an insane chain reaction.
-
-Think you can beat it?
-
-I built Combo Chain Blast solo.
-
-🎮 Play free 👇
-https://apps.apple.com/us/app/combo-chain-blast/id6817666697
-
-#IndieGameDev #MobileGaming''',
-'deste': '''You took a screenshot 3 months ago.
-
-Now you need it.
-
-Good luck finding it among 2,000 others. 💀
-
-That's why I built Deste.
-
-Search screenshots by the text inside them.
-
-No cloud. No endless scrolling.
-
-Free on iOS & Mac 👇
-https://apps.apple.com/us/app/deste-smart-screenshots/id6822008867
-
-#SwiftUI #IndieDev'''
-}
-SLOTS=[('combo','combo1.mp4'),('deste','deste.mp4'),('combo','combo2.mp4'),('deste','deste.mp4')]
-
-def auth():
-    names=['X_API_KEY','X_API_SECRET','X_ACCESS_TOKEN','X_ACCESS_TOKEN_SECRET']
-    vals=[os.getenv(n) for n in names]
-    if not all(vals): raise RuntimeError('Missing X credentials: '+', '.join(n for n,v in zip(names,vals) if not v))
-    return OAuth1(*vals)
-
-def check(r):
-    if not r.ok: raise RuntimeError(f'X API {r.status_code}: {r.text[:700]}')
-    return r.json()
+def api_result(response):
+    if not response.ok:
+        raise RuntimeError(f'X API error {response.status_code}: {response.text[:500]}')
+    return response.json() if response.content else {}
 
 def upload_video(path, oauth):
-    url='https://upload.twitter.com/1.1/media/upload.json'
-    size=path.stat().st_size
-    result=check(requests.post(url,auth=oauth,data={'command':'INIT','total_bytes':size,'media_type':'video/mp4','media_category':'tweet_video'},timeout=45))
-    media_id=result['media_id_string']
+    # X media upload API endpoint; account access/credits and endpoint availability are required.
+    url = 'https://upload.twitter.com/1.1/media/upload.json'
+    size = path.stat().st_size
+    init = api_result(requests.post(url, auth=oauth, data={
+        'command': 'INIT', 'total_bytes': size, 'media_type': 'video/mp4',
+        'media_category': 'tweet_video'}, timeout=45))
+    media_id = init['media_id_string']
     with path.open('rb') as f:
-        segment=0
-        while chunk:=f.read(4*1024*1024):
-            _append(url,oauth,media_id,segment,chunk)
-            segment+=1
-    result=check(requests.post(url,auth=oauth,data={'command':'FINALIZE','media_id':media_id},timeout=45))
-    info=result.get('processing_info')
-    for _ in range(30):
-        if not info or info.get('state')=='succeeded': return media_id
-        if info.get('state')=='failed': raise RuntimeError('Video processing failed: '+str(info))
-        time.sleep(min(max(info.get('check_after_secs',2),1),15))
-        result=check(requests.get(url,auth=oauth,params={'command':'STATUS','media_id':media_id},timeout=45))
-        info=result.get('processing_info')
-    raise TimeoutError('Video processing not finished')
-
-def _append(url,oauth,media_id,segment,chunk):
-    r=requests.post(url,auth=oauth,data={'command':'APPEND','media_id':media_id,'segment_index':segment},files={'media':('chunk',chunk,'application/octet-stream')},timeout=120)
-    if not r.ok: raise RuntimeError(f'APPEND failed {r.status_code}: {r.text[:500]}')
+        index = 0
+        while True:
+            chunk = f.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            response = requests.post(url, auth=oauth, data={
+                'command': 'APPEND', 'media_id': media_id, 'segment_index': index
+            }, files={'media': ('segment', chunk, 'application/octet-stream')}, timeout=120)
+            if not response.ok:
+                raise RuntimeError(f'X upload APPEND failed {response.status_code}: {response.text[:500]}')
+            index += 1
+    result = api_result(requests.post(url, auth=oauth, data={'command': 'FINALIZE', 'media_id': media_id}, timeout=45))
+    info = result.get('processing_info')
+    for _ in range(60):
+        if not info or info.get('state') == 'succeeded':
+            return media_id
+        if info.get('state') == 'failed':
+            raise RuntimeError('X video processing failed: ' + str(info))
+        time.sleep(min(max(int(info.get('check_after_secs', 3)), 1), 20))
+        result = api_result(requests.get(url, auth=oauth, params={'command': 'STATUS', 'media_id': media_id}, timeout=45))
+        info = result.get('processing_info')
+    raise TimeoutError('X video processing timed out')
 
 def main():
-    logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
-    now=datetime.now(TZ)
-    if now.minute not in (0,30):
-        logging.info('Not a scheduled half-hour slot'); return
-    # Absolute 2-hour rotation anchored at 18:00 Istanbul time.
-    slot_index=((now.hour*2 + now.minute//30)-(18*2))%4
-    app,video=SLOTS[slot_index]
-    slot=now.strftime('%Y-%m-%d %H:%M')
-    with sqlite3.connect(DB) as db:
-        db.execute('CREATE TABLE IF NOT EXISTS posts(slot TEXT PRIMARY KEY, app TEXT, video TEXT, tweet_id TEXT, status TEXT)')
-        if db.execute('SELECT 1 FROM posts WHERE slot=?',(slot,)).fetchone():
-            logging.info('Already processed slot %s',slot); return
-        path=ROOT/'videos'/video
-        if not path.is_file(): raise FileNotFoundError(path)
-        if DRY_RUN:
-            logging.info('DRY RUN slot=%s app=%s video=%s text=%s',slot,app,video,TEXT[app]); return
-        oauth=auth()
-        media_id=upload_video(path,oauth)
-        result=check(requests.post('https://api.x.com/2/tweets',auth=oauth,json={'text':TEXT[app],'media':{'media_ids':[media_id]}},timeout=45))
-        tweet_id=result['data']['id']
-        db.execute('INSERT INTO posts VALUES (?,?,?,?,?)',(slot,app,video,tweet_id,'posted'))
-        db.commit()
-        logging.info('Published %s %s tweet=%s',app,video,tweet_id)
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
+    now = datetime.now(TZ)
+    # GitHub Actions scheduled jobs may run late. Choose the last half-hour slot.
+    slot_index = ((now.hour * 2 + now.minute // 30) - 36) % 4
+    posts = json.loads((ROOT / 'posts.json').read_text(encoding='utf-8'))
+    post = posts[slot_index]
+    if not STATE.exists():
+        STATE.write_text('{"published": {}}\n', encoding='utf-8')
+    state = json.loads(STATE.read_text(encoding='utf-8'))
+    published = state.setdefault('published', {})
+    key = post['id']
+    if key in published:
+        logging.info('Skipped already published content: %s', key)
+        return
+    path = ROOT / 'videos' / post['video']
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if DRY_RUN:
+        logging.info('DRY RUN: would publish %s with %s (%s)', post['app'], post['video'], key)
+        return
+    if os.getenv('ENABLE_PUBLISHING', 'false').lower() != 'true':
+        logging.info('Publishing disabled: set ENABLE_PUBLISHING=true after testing and reviewing content')
+        return
+    oauth = credentials()
+    media_id = upload_video(path, oauth)
+    result = api_result(requests.post('https://api.x.com/2/tweets', auth=oauth,
+        json={'text': post['text'], 'media': {'media_ids': [media_id]}}, timeout=45))
+    tweet_id = result['data']['id']
+    published[key] = {'tweet_id': tweet_id, 'time': now.isoformat(), 'video': post['video']}
+    STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    logging.info('Published %s tweet ID %s', key, tweet_id)
 
-if __name__=='__main__': main()
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:
+        logging.exception('AutoPilot failed')
+        sys.exit(1)
