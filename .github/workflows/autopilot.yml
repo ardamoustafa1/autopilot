@@ -1,0 +1,40 @@
+name: X AutoPilot
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: x-autopilot
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Publish scheduled content (or dry-run)
+        env:
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }}
+          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
+          ENABLE_PUBLISHING: ${{ vars.ENABLE_PUBLISHING || 'false' }}
+        run: python bot.py
+      - name: Persist successful publication state
+        run: |
+          if ! git diff --quiet -- state.json; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add state.json
+            git commit -m 'Record published X post'
+            git push
+          fi
