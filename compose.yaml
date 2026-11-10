@@ -1,0 +1,7 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    volumes:
+      - ./state.sqlite3:/app/state.sqlite3
+    restart: "no"
